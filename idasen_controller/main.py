@@ -58,6 +58,7 @@ if not os.path.isfile(DEFAULT_CONFIG_PATH):
     os.makedirs(os.path.dirname(DEFAULT_CONFIG_PATH), exist_ok=True)
     shutil.copyfile(os.path.join(os.path.dirname(__file__), 'example', 'config.yaml'), DEFAULT_CONFIG_PATH)
 
+event_listeners = set()
 config = {
     "mac_address": None,
     "stand_height": BASE_HEIGHT + 420,
@@ -149,8 +150,6 @@ config['mac_address'] = config['mac_address'].upper()
 config['stand_height_raw'] = mmToRaw(config['stand_height'])
 config['sit_height_raw'] = mmToRaw(config['sit_height'])
 config['height_tolerance_raw'] = 10 * config['height_tolerance']
-if config['move_to']:
-    config['move_to_raw'] = mmToRaw(config['move_to'])
 
 if IS_WINDOWS:
     # Windows doesn't use this parameter so rename it so it looks nice for the logs
@@ -181,17 +180,6 @@ async def stop(client):
         # It doesn't like this on windows
         await client.write_gatt_char(UUID_REFERENCE_INPUT, COMMAND_REFERENCE_INPUT_STOP)
 
-async def subscribe(client, uuid, callback):
-    """Listen for notifications on a characteristic"""
-    await client.start_notify(uuid, callback)
-
-async def unsubscribe(client, uuid):
-    try:
-        await client.stop_notify(uuid)
-    except KeyError:
-        # This happens on windows, I don't know why
-        pass
-
 async def move_to(client, target):
     """Move the desk to a specified height"""
 
@@ -219,7 +207,7 @@ async def move_to(client, target):
         # and stop.
         if speed == 0 or has_reached_target(height, target):
             asyncio.create_task(stop(client))
-            asyncio.create_task(unsubscribe(client, UUID_HEIGHT))
+            event_listeners.remove(_move_to)
             try:
                 move_done.set_result(True)
             except asyncio.exceptions.InvalidStateError:
@@ -243,7 +231,7 @@ async def move_to(client, target):
     # Listen for changes to desk height and send first move command (if we are 
     # not already at the target height).
     if not has_reached_target(initial_height, target):
-        await subscribe(client, UUID_HEIGHT, _move_to)
+        event_listeners.add(_move_to)
         if direction == "UP":
             asyncio.create_task(move_up(client))
         elif direction == "DOWN":
@@ -252,7 +240,7 @@ async def move_to(client, target):
             await asyncio.wait_for(move_done, timeout=config['movement_timeout'])
         except asyncio.TimeoutError as e:
             print('Timed out while waiting for desk')
-            await unsubscribe(client, UUID_HEIGHT)
+            event_listeners.remove(_move_to)
 
 
 def unpickle_desk():
@@ -304,12 +292,16 @@ async def connect(client = None, attempt = 0):
         os._exit(1)
     # Cache the Bleak device config to connect more quickly in future
     pickle_desk(desk)
+    def notify_listeners(sender, data):
+        for listener in set(event_listeners):
+            listener(sender, data)
     try:
         print('Connecting\r', end ="")
         if not client:
             client = BleakClient(desk, device=config['adapter_name'])
         await client.connect(timeout=config['connection_timeout'])
         print("Connected {}".format(config['mac_address']))
+        await client.start_notify(UUID_HEIGHT, notify_listeners)
         return client 
     except BleakError as e:
         if attempt == 0 and pickled:
@@ -338,7 +330,7 @@ async def run_command(client, config):
     target = None
     if config['monitor']:
         # Print changes to height data
-        await subscribe(client, UUID_HEIGHT, print_height_data)
+        event_listeners.add(print_height_data)
         loop = asyncio.get_event_loop()
         wait = loop.create_future()
         await wait
@@ -352,7 +344,7 @@ async def run_command(client, config):
         await move_to(client, target)
     elif config['move_to']:
         # Move to custom height
-        target = config['move_to_raw']
+        target = mmToRaw(config['move_to'])
         await move_to(client, target)
     if target:
         # If we were moving to a target height, wait, then print the actual final height
@@ -366,22 +358,45 @@ async def run_server(client, config):
         print("Lost connection with {}".format(client.address))
         asyncio.create_task(connect(client))
     client.set_disconnected_callback(disconnect_callback)
+
     server = await asyncio.start_server(functools.partial(run_forwarded_command, client, config), config['server_address'], config['server_port'])
     print("Server listening")
     await server.serve_forever()
 
 async def run_forwarded_command(client, config, reader, writer):
     """Run commands received by the tcp server"""
-    print("Received command")
-    request = (await reader.read()).decode('utf8')
-    forwarded_config = json.loads(str(request))
-    merged_config = {**config, **forwarded_config}
-    await run_command(client, merged_config)
+    print("Received connection")
+    pending_write = None
+    async def send_height_change(height, speed):
+        if (not writer.is_closing()):
+            writer.write(json.dumps({ "height": rawToMM(height), "speed": rawToSpeed(speed) }).encode('utf8'))
+            writer.write('\n'.encode('utf8'))
+            await writer.drain()
+    def height_change(sender, data):
+        nonlocal pending_write
+        height, speed = struct.unpack("<Hh", data)
+        if pending_write:
+            pending_write.cancel()
+        pending_write = asyncio.create_task(send_height_change(height, speed))
+    event_listeners.add(height_change)
+    while True:
+        if reader.at_eof():
+            break
+        request = (await reader.readline()).decode('utf8')
+        if not request:
+            break
+        forwarded_config = json.loads(str(request))
+        merged_config = {**config, **forwarded_config}
+        await run_command(client, merged_config)
+    event_listeners.remove(height_change)
+    if pending_write:
+        pending_write.cancel()
     writer.close()
+    print("Connection Closed")
 
 async def forward_command(config):
     """Send commands to the tcp server"""
-    allowed_keys = ["sit", "stand", "move_to", "move_to_raw"]
+    allowed_keys = ["sit", "stand", "move_to"]
     forwarded_config = { key: config[key] for key in allowed_keys if key in config }
     reader, writer = await asyncio.open_connection(config['server_address'], config['server_port'])
     writer.write(json.dumps(forwarded_config).encode())
